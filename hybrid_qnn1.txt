@@ -1,0 +1,177 @@
+print("STEP 1: Script started", flush=True)
+import yfinance as yf
+import pennylane as qml
+import pennylane.numpy as pnp
+import numpy as np
+import pandas as pd
+
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import accuracy_score, classification_report
+
+# 1. Download historical stock data
+ticker = "AAPL"
+data = yf.Ticker(ticker).history(period="2y")
+print("STEP 2: Stock data downloaded", len(data), flush=True)
+
+
+if data.empty:
+    raise ValueError("No stock data found. Check your internet connection.")
+
+# 2. Create input features
+data["Daily_Return"] = data["Close"].pct_change()
+data["MA_5"] = data["Close"].rolling(5).mean()
+data["Volatility_5"] = data["Daily_Return"].rolling(5).std()
+
+# Predict whether the next closing price will rise
+data["Next_Close"] = data["Close"].shift(-1)
+data["Target"] = (data["Next_Close"] > data["Close"]).astype(int)
+
+features = ["Daily_Return", "MA_5", "Volatility_5"]
+
+data = data.dropna(subset=features + ["Next_Close"])
+
+X = data[features].to_numpy(dtype=float)
+y = data["Target"].to_numpy(dtype=int)
+
+# 3. Chronological train/test split
+split = int(len(data) * 0.8)
+
+X_train = X[:split]
+X_test = X[split:]
+y_train = y[:split]
+y_test = y[split:]
+
+if len(X_train) == 0 or len(X_test) == 0:
+    raise ValueError("Not enough data to train and test the model.")
+
+if len(np.unique(y_train)) < 2:
+    raise ValueError("Training data must contain both target classes.")
+
+# 4. Scale using training data only
+scaler = MinMaxScaler()
+X_train = scaler.fit_transform(X_train)
+X_test = scaler.transform(X_test)
+
+X_train = np.clip(X_train, 0, 1)
+X_test = np.clip(X_test, 0, 1)
+
+# Four circuit inputs: three features plus one zero
+X_train = np.column_stack([X_train, np.zeros(len(X_train))])
+X_test = np.column_stack([X_test, np.zeros(len(X_test))])
+
+# 5. Define a trainable four-qubit circuit
+n_qubits = 4
+n_layers = 2
+
+dev = qml.device("default.qubit", wires=n_qubits)
+
+@qml.qnode(dev, interface="autograd", diff_method="backprop")
+def quantum_circuit(inputs, circuit_weights):
+    qml.AngleEmbedding(
+        inputs * np.pi,
+        wires=range(n_qubits),
+        rotation="Y"
+    )
+
+    qml.StronglyEntanglingLayers(
+        circuit_weights,
+        wires=range(n_qubits)
+    )
+
+    return tuple(
+        qml.expval(qml.PauliZ(i))
+        for i in range(n_qubits)
+    )
+
+# 6. Hybrid model: quantum outputs + trainable classical layer
+def predict_probability(inputs, params):
+    circuit_weights = params[:24].reshape((n_layers, n_qubits, 3))
+    readout_weights = params[24:28]
+    bias = params[28]
+
+    quantum_outputs = pnp.stack(quantum_circuit(inputs, circuit_weights))
+
+    score = pnp.dot(quantum_outputs, readout_weights) + bias
+
+    return 1.0 / (1.0 + pnp.exp(-pnp.clip(score, -50, 50)))
+
+# 7. Binary cross-entropy loss
+def loss_function(params, batch_X, batch_y):
+    probabilities = pnp.stack([
+        predict_probability(row, params)
+        for row in batch_X
+    ])
+
+    probabilities = pnp.clip(probabilities, 1e-7, 1 - 1e-7)
+
+    return -pnp.mean(
+        batch_y * pnp.log(probabilities)
+        + (1 - batch_y) * pnp.log(1 - probabilities)
+    )
+
+# 8. Initialize trainable parameters
+rng = np.random.default_rng(42)
+
+initial_params = np.concatenate([
+    rng.normal(0, 0.1, 24),
+    rng.normal(0, 0.1, 4),
+    np.zeros(1)
+])
+
+params = pnp.array(initial_params, requires_grad=True)
+optimizer = qml.AdamOptimizer(stepsize=0.03)
+
+# 9. Train the hybrid model
+epochs = 10
+batch_size = 16
+
+print("Training hybrid quantum neural network...")
+
+for epoch in range(epochs):
+    order = rng.permutation(len(X_train))
+
+    for start in range(0, len(order), batch_size):
+        indices = order[start:start + batch_size]
+
+        batch_X = pnp.array(X_train[indices])
+        batch_y = pnp.array(y_train[indices], requires_grad=False)
+
+        params = optimizer.step(
+            lambda p: loss_function(p, batch_X, batch_y),
+            params
+        )
+
+    epoch_loss = loss_function(params, X_train, y_train)
+
+    print(
+        f"Epoch {epoch + 1}/{epochs} - "
+        f"Loss: {float(epoch_loss):.4f}"
+    )
+
+# 10. Evaluate on unseen chronological test data
+test_probabilities = np.array([
+    float(predict_probability(row, params))
+    for row in X_test
+])
+
+predictions = (test_probabilities >= 0.5).astype(int)
+
+accuracy = accuracy_score(y_test, predictions)
+
+print("\nHYBRID QUANTUM NEURAL NETWORK RESULTS")
+print("-------------------------------------")
+print("Stock:", ticker)
+print("Training rows:", len(X_train))
+print("Testing rows:", len(X_test))
+print(f"Test accuracy: {accuracy:.2%}")
+
+print("\nClassification report:")
+print(
+    classification_report(
+        y_test,
+        predictions,
+        labels=[0, 1],
+        target_names=["Down/No Rise", "Rise"],
+        zero_division=0
+    )
+)
